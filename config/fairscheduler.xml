@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!--
+  FAIR scheduler pools, one per medallion layer. Bronze ingestion is cheap but
+  latency-critical (it keeps Kafka lag at zero), so it gets a guaranteed core
+  and cannot be starved by the heavier stateful gold scoring job.
+-->
+<allocations>
+  <pool name="bronze">
+    <schedulingMode>FAIR</schedulingMode>
+    <weight>2</weight>
+    <minShare>1</minShare>
+  </pool>
+  <pool name="silver">
+    <schedulingMode>FAIR</schedulingMode>
+    <weight>2</weight>
+    <minShare>1</minShare>
+  </pool>
+  <pool name="gold">
+    <schedulingMode>FAIR</schedulingMode>
+    <weight>3</weight>
+    <minShare>1</minShare>
+  </pool>
+  <pool name="gold_aggregates">
+    <schedulingMode>FAIR</schedulingMode>
+    <weight>1</weight>
+    <minShare>0</minShare>
+  </pool>
+</allocations>

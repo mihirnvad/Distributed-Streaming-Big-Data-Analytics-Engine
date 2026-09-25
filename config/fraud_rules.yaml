@@ -1,0 +1,80 @@
+# Fraud rule engine configuration.
+#
+# Each rule contributes its weight when it fires; weights combine with a noisy-OR:
+#     fraud_score = 1 - prod(1 - weight_i)   over all rules that fired
+# so independent weak signals reinforce each other without the score exceeding 1.
+# Changing this file changes scoring on the next pipeline restart - no code change.
+
+version: "2026.09-r3"
+alert_threshold: 0.60
+
+# Lower bound of each risk band, evaluated from the top.
+risk_levels:
+  CRITICAL: 0.85
+  HIGH: 0.60
+  MEDIUM: 0.30
+
+rules:
+  VELOCITY_BURST:
+    enabled: true
+    weight: 0.60
+    description: >-
+      Card used much faster than its own learned baseline (EWMA of inter-arrival
+      gaps). Falls back to stricter absolute thresholds while the baseline warms up.
+    params:
+      min_count_1m: 5
+      min_count_5m: 8
+      baseline_multiplier: 4.0
+      cold_start_min_count_1m: 6
+      cold_start_min_count_5m: 10
+
+  CARD_TESTING:
+    enabled: true
+    weight: 0.70
+    description: Several sub-$5 authorisations at different merchants within five minutes.
+    params:
+      min_small_txns_5m: 4
+      min_distinct_merchants_5m: 3
+
+  AMOUNT_SPIKE:
+    enabled: true
+    weight: 0.45
+    description: Ticket size far above the card's own history (z-score of log amount).
+    params:
+      min_zscore: 3.0
+
+  IMPOSSIBLE_TRAVEL:
+    enabled: true
+    weight: 0.75
+    description: Implied speed between consecutive swipes faster than a commercial jet.
+    params:
+      max_speed_kmh: 900
+      min_distance_km: 300
+
+  HIGH_RISK_MCC_LARGE_TICKET:
+    enabled: true
+    weight: 0.30
+    description: Large purchase in a high-risk merchant category (electronics, jewelry, gambling, crypto).
+    params:
+      min_amount_usd: 750
+
+  FAR_FROM_HOME_CARD_PRESENT:
+    enabled: true
+    weight: 0.20
+    description: Card-present transaction far from the cardholder's home city.
+    params:
+      min_distance_km: 1500
+
+  MAGSTRIPE_ON_CHIP_CARD:
+    enabled: true
+    weight: 0.25
+    description: Magnetic-stripe swipe on a chip card - the signature of a counterfeit clone.
+    params: {}
+
+  NEW_ACCOUNT_HIGH_VALUE:
+    enabled: true
+    weight: 0.25
+    description: High-value purchase on an account opened in the last 30 days.
+    params:
+      max_account_age_days: 30
+      min_amount_usd: 500

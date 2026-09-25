@@ -1,0 +1,39 @@
+[project]
+name = "realtime-fraud-lakehouse"
+version = "1.0.0"
+description = "Real-time payment fraud detection on Kafka + Spark Structured Streaming + Delta Lake, served from a PostgreSQL star schema."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv", "build"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N"]
+ignore = [
+    "RUF001",  # ambiguous unicode in strings (status icons in the dashboard are intentional)
+    "SIM108",  # ternaries are not always clearer
+    "N812",    # `from pyspark.sql import functions as F` is the PySpark convention
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["common", "producer", "streaming", "batch", "dashboard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "spark: needs a local Spark session (JVM 17/21)",
+    "integration: needs a reachable PostgreSQL (TEST_POSTGRES_DSN)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pyspark.*",
+    "ignore::FutureWarning:pyspark.*",
+]
+
+[tool.coverage.run]
+source = ["common", "producer", "streaming", "batch", "dashboard"]
+omit = ["dashboard/app.py"]

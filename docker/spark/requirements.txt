@@ -1,0 +1,8 @@
+# Python dependencies installed into the Spark image (driver + executors).
+# pandas/pyarrow power applyInPandasWithState; psycopg powers the Postgres sinks.
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==21.0.0
+psycopg[binary]==3.3.6
+PyYAML==6.0.3
+pytest==9.1.1

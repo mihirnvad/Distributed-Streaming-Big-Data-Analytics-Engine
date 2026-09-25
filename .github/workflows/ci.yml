@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.16.9
+      - run: ruff check .
+      - run: ruff format --check .
+
+  unit-tests:
+    name: Unit + Spark tests
+    runs-on: ubuntu-latest
+    env:
+      REQUIRE_SPARK: "1"  # fail (not skip) if the JVM/Spark setup is broken
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -m "not integration" --cov --cov-report=term-missing:skip-covered
+
+  sql-integration:
+    name: Warehouse SQL integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fraud
+          POSTGRES_PASSWORD: fraud
+          POSTGRES_DB: fraud_dw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U fraud"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_POSTGRES_DSN: postgresql://fraud:fraud@localhost:5432/postgres
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -m integration -v
+
+  docker:
+    name: Compose config & image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: docker compose config --quiet
+      - name: Build Spark image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/spark/Dockerfile
+          tags: fraud-pipeline/spark:ci
+          load: true
+          cache-from: type=gha,scope=spark
+          cache-to: type=gha,mode=max,scope=spark
+      - name: Build app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/app/Dockerfile
+          tags: fraud-pipeline/app:ci
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=max,scope=app
+      - name: Connector JARs and PySpark importable in the Spark image
+        run: |
+          docker run --rm --entrypoint bash fraud-pipeline/spark:ci -c \
+            'ls /opt/spark/jars | grep -E "delta-spark|spark-sql-kafka|postgresql" && python3 -c "import pyspark, pandas, pyarrow, psycopg; print(pyspark.__version__)"'

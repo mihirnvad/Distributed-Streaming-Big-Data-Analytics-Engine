@@ -1,0 +1,11 @@
+# Runtime dependencies for the Python services (producer, seeder, dashboard) and the
+# Python side of the Spark jobs. PySpark itself ships with the Spark image; for
+# local development install requirements-dev.txt, which adds it.
+confluent-kafka==2.15.1
+psycopg[binary]==3.3.6
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==21.0.0
+PyYAML==6.0.3
+streamlit==1.64.0
+plotly==6.9.0

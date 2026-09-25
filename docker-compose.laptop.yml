@@ -1,0 +1,34 @@
+# Laptop mode: run the streaming job with Spark in local mode inside the driver
+# container instead of on the standalone cluster (master + 2 workers).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.laptop.yml up -d
+#
+# Same code, same queries, same checkpoints - only the executors move into the
+# driver JVM. It saves ~3 GB of RAM (three JVMs), which matters on machines where
+# the Docker VM would otherwise be paged to disk by the host.
+
+services:
+  spark-master:
+    profiles: [cluster]
+  spark-worker-1:
+    profiles: [cluster]
+  spark-worker-2:
+    profiles: [cluster]
+
+  pipeline:
+    command: ["/opt/spark/bin/spark-submit",
+              "--master", "local[4]",
+              "--driver-memory", "2g",
+              "/opt/app/streaming/run_pipeline.py"]
+    depends_on: !override
+      kafka-init:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+
+  reconcile:
+    command: ["/opt/spark/bin/spark-submit",
+              "--master", "local[2]",
+              "--driver-memory", "1g",
+              "/opt/app/batch/historical_reconciliation.py"]
+    depends_on: !override {}

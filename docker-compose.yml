@@ -1,0 +1,283 @@
+# One-command local deployment of the full pipeline:
+#
+#   docker compose up -d --build          # Kafka, Postgres, Spark (1 master + 2 workers), pipeline, producer, dashboard
+#   docker compose --profile batch run --rm reconcile      # nightly reconciliation job, on demand
+#   docker compose --profile test run --rm tests           # PySpark test-suite inside the Spark image
+#   docker compose --profile tools up -d kafka-ui adminer  # optional admin UIs
+#
+# UIs: dashboard http://localhost:8501 | Spark master http://localhost:8080 | Spark app http://localhost:4040
+
+name: fraud-pipeline
+
+x-pipeline-env: &pipeline-env
+  TZ: UTC
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TRANSACTIONS_TOPIC: payments.transactions
+  KAFKA_CHARGEBACKS_TOPIC: payments.chargebacks
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-fraud_dw}
+  POSTGRES_USER: ${POSTGRES_USER:-fraud}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+  LAKEHOUSE_ROOT: /data/lakehouse
+  SIM_USERS: ${SIM_USERS:-100000}
+  SIM_MERCHANTS: ${SIM_MERCHANTS:-2500}
+  SIM_SEED: ${SIM_SEED:-42}
+  SIM_FRAUD_SCENARIO_RATE: ${SIM_FRAUD_SCENARIO_RATE:-0.0006}
+  STREAM_TRIGGER_INTERVAL: ${STREAM_TRIGGER_INTERVAL:-2 seconds}
+  STREAM_WATERMARK_DELAY: ${STREAM_WATERMARK_DELAY:-10 minutes}
+
+x-spark: &spark
+  image: fraud-pipeline/spark:latest
+  environment:
+    <<: *pipeline-env
+    SPARK_NO_DAEMONIZE: "true"
+  volumes:
+    - lakehouse:/data/lakehouse
+  networks: [pipeline]
+
+x-app: &app
+  image: fraud-pipeline/app:latest
+  environment:
+    <<: *pipeline-env
+  networks: [pipeline]
+
+services:
+  # ------------------------------------------------------------------ messaging
+  kafka:
+    image: apache/kafka:4.1.2
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller           # KRaft: no ZooKeeper
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LOG_RETENTION_HOURS: 6            # laptop-friendly; bronze is the long-term replay source
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Plain TCP probe: the CLI tools start a JVM per call and flap under load.
+      # kafka-init's admin client retries until the broker actually serves requests.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9092'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [pipeline]
+
+  kafka-init:
+    image: apache/kafka:4.1.2
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        topics=/opt/kafka/bin/kafka-topics.sh
+        # Keyed by user_id: every card maps to one partition, preserving per-card order.
+        $$topics --bootstrap-server kafka:9092 --create --if-not-exists --topic payments.transactions \
+          --partitions 6 --replication-factor 1 --config retention.ms=21600000 --config retention.bytes=268435456           --config compression.type=producer
+        $$topics --bootstrap-server kafka:9092 --create --if-not-exists --topic payments.chargebacks \
+          --partitions 2 --replication-factor 1 --config retention.ms=604800000
+        $$topics --bootstrap-server kafka:9092 --describe --topic payments.transactions
+    networks: [pipeline]
+
+  # ------------------------------------------------------------------ serving warehouse
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fraud_dw}
+      POSTGRES_USER: ${POSTGRES_USER:-fraud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - max_connections=200
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    shm_size: 256m
+    networks: [pipeline]
+
+  seed:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    command: ["python", "-m", "producer.seed_dimensions"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ------------------------------------------------------------------ Spark cluster
+  spark-master:
+    <<: *spark
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/spark-master/7077'"]  # master binds its hostname, not localhost
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  spark-worker-1: &spark-worker
+    <<: *spark
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077",
+              "--cores", "2", "--memory", "1536m", "--webui-port", "8081",
+              "--work-dir", "/opt/spark/work-dir/worker"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+
+  spark-worker-2:
+    <<: *spark-worker
+    hostname: spark-worker-2
+    ports:
+      - "8082:8081"
+
+  # Streaming driver: runs all Bronze/Silver/Gold queries (client mode on the cluster).
+  pipeline:
+    <<: *spark
+    hostname: pipeline
+    command: ["/opt/spark/bin/spark-submit",
+              "--conf", "spark.driver.host=pipeline",
+              "--conf", "spark.driver.bindAddress=0.0.0.0",
+              "--conf", "spark.driver.port=7078",
+              "--conf", "spark.blockManager.port=7079",
+              "/opt/app/streaming/run_pipeline.py"]
+    ports:
+      - "4040:4040"
+    depends_on:
+      spark-worker-1:
+        condition: service_started
+      spark-worker-2:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  # ------------------------------------------------------------------ event source + UI
+  producer:
+    <<: *app
+    command: ["python", "-m", "producer.transaction_producer",
+              "--rate", "${PRODUCER_RATE:-1000}", "--workers", "${PRODUCER_WORKERS:-1}"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  dashboard:
+    <<: *app
+    working_dir: /app/dashboard
+    command: ["streamlit", "run", "app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    ports:
+      - "8501:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ on-demand jobs
+  reconcile:
+    <<: *spark
+    profiles: [batch]
+    hostname: reconcile
+    command: ["/opt/spark/bin/spark-submit",
+              "--conf", "spark.driver.host=reconcile",
+              "--conf", "spark.driver.bindAddress=0.0.0.0",
+              "/opt/app/batch/historical_reconciliation.py"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  tests:
+    <<: *spark
+    profiles: [test]
+    environment:
+      <<: *pipeline-env
+      PYSPARK_PYTHON: python3
+    command: ["python3", "-m", "pytest", "-q", "-m", "not integration"]
+    volumes: []
+
+  # ------------------------------------------------------------------ optional tooling
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.3.0
+    profiles: [tools]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [pipeline]
+
+  adminer:
+    image: adminer:5
+    profiles: [tools]
+    ports:
+      - "8091:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [pipeline]
+
+volumes:
+  lakehouse:
+  kafka-data:
+  pg-data:
+
+networks:
+  pipeline:
+    name: fraud-pipeline
