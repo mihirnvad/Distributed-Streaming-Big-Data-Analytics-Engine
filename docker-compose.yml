@@ -193,6 +193,12 @@ services:
               "/opt/app/streaming/run_pipeline.py"]
     ports:
       - "4040:4040"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/pipeline-ready"]  # written once all queries are running
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
     depends_on:
       spark-worker-1:
         condition: service_started
@@ -214,6 +220,8 @@ services:
         condition: service_completed_successfully
       seed:
         condition: service_completed_successfully
+      pipeline:
+        condition: service_healthy  # start traffic once the streaming queries are up
     restart: unless-stopped
 
   dashboard:

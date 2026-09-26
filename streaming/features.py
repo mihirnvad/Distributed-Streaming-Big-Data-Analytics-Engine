@@ -50,6 +50,16 @@ FEATURE_NAMES = [
     "history_count",
 ]  # fmt: skip
 
+# What actually crosses the JVM/Python boundary. Spark calls the stateful function once
+# per card per micro-batch and each column costs a pandas conversion per call, so the
+# operator receives only what the engine reads plus one opaque ``passthrough`` string
+# (the rest of the silver row, packed/unpacked by the JVM), and returns the features as
+# a single array column aligned with FEATURE_NAMES (see streaming/gold_sink.py).
+ENGINE_INPUT_COLUMNS = [
+    "user_id", "transaction_id", "event_ts", "amount_usd", "merchant_id", "location_lat", "location_lon", "passthrough",
+]  # fmt: skip
+ENGINE_OUTPUT_COLUMNS = ["transaction_id", "event_ts", "passthrough", "features"]
+
 
 @dataclass
 class UserState:
@@ -224,28 +234,33 @@ def _epoch_ms(series: pd.Series) -> np.ndarray:
 
 
 def compute_features(engine: UserFeatureEngine, pdf: pd.DataFrame) -> pd.DataFrame:
-    """Run the engine over one card's rows (sorted by event time) and append feature columns.
+    """Run the engine over one card's rows in event-time order.
 
-    This runs once per card per micro-batch, and most cards have a single row, so it
-    avoids per-call pandas overhead (no sort for one row, one DataFrame build, no concat).
+    Input has ENGINE_INPUT_COLUMNS; output has ENGINE_OUTPUT_COLUMNS, where ``features``
+    holds one list per row aligned with FEATURE_NAMES. Most cards have a single row per
+    micro-batch, so the one-row path skips the sort.
     """
     if len(pdf) > 1:
         pdf = pdf.sort_values(["event_ts", "transaction_id"], kind="stable")
-    features = [
-        engine.process(int(t), float(a), str(m), float(la), float(lo))
-        for t, a, m, la, lo in zip(
-            _epoch_ms(pdf["event_ts"]),
-            pdf["amount_usd"].to_numpy(dtype="float64"),
-            pdf["merchant_id"].tolist(),
-            pdf["location_lat"].to_numpy(dtype="float64"),
-            pdf["location_lon"].to_numpy(dtype="float64"),
-            strict=True,
-        )
-    ]
-    data = {column: pdf[column].to_numpy() for column in FEATURE_INPUT_COLUMNS}
-    for name in FEATURE_NAMES:
-        data[name] = [f[name] for f in features]
-    return pd.DataFrame(data)
+    features = []
+    for t, a, m, la, lo in zip(
+        _epoch_ms(pdf["event_ts"]),
+        pdf["amount_usd"].to_numpy(dtype="float64"),
+        pdf["merchant_id"].tolist(),
+        pdf["location_lat"].to_numpy(dtype="float64"),
+        pdf["location_lon"].to_numpy(dtype="float64"),
+        strict=True,
+    ):
+        f = engine.process(int(t), float(a), str(m), float(la), float(lo))
+        features.append([f[name] for name in FEATURE_NAMES])
+    return pd.DataFrame(
+        {
+            "transaction_id": pdf["transaction_id"].to_numpy(),
+            "event_ts": pdf["event_ts"].to_numpy(),
+            "passthrough": pdf["passthrough"].to_numpy(),
+            "features": features,
+        }
+    )
 
 
 def make_state_function(idle_timeout_ms: int):

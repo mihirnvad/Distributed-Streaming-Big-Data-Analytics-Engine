@@ -37,7 +37,7 @@ from streaming.schemas import (
     TRANSACTION_EVENT_SCHEMA,
     with_corrupt_record,
 )
-from streaming.spark_session import ensure_delta_table, scheduler_pool, with_trigger
+from streaming.spark_session import ensure_delta_table, read_delta_stream, scheduler_pool, with_trigger
 
 REQUIRED_TRANSACTION_FIELDS = ("transaction_id", "event_ts", "user_id", "merchant_id", "amount", "currency")
 REQUIRED_CHARGEBACK_FIELDS = ("chargeback_id", "transaction_id", "user_id", "reason_code", "amount", "currency")
@@ -216,7 +216,7 @@ def start(spark: SparkSession, settings: Settings) -> list[StreamingQuery]:
 
     queries: list[StreamingQuery] = []
     with scheduler_pool(spark, "silver"):
-        bronze_txn = parse_transactions(spark.readStream.format("delta").load(lake.bronze_transactions))
+        bronze_txn = parse_transactions(read_delta_stream(spark, lake.bronze_transactions, s.max_bytes_per_trigger))
 
         clean = deduplicate(valid_transactions(bronze_txn), "transaction_id", "event_ts", s.watermark_delay)
         queries.append(
@@ -243,7 +243,9 @@ def start(spark: SparkSession, settings: Settings) -> list[StreamingQuery]:
         )
 
         chargebacks = deduplicate(
-            valid_chargebacks(parse_chargebacks(spark.readStream.format("delta").load(lake.bronze_chargebacks))),
+            valid_chargebacks(
+                parse_chargebacks(read_delta_stream(spark, lake.bronze_chargebacks, s.max_bytes_per_trigger))
+            ),
             "chargeback_id",
             "reported_ts",
             s.watermark_delay,

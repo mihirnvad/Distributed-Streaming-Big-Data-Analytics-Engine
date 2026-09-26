@@ -137,6 +137,14 @@ plan contained **23 `from_json` calls per record**. Parsing through a generator
 (`inline(array(from_json(...)))`) is an optimisation barrier and brings it to **1**
 (see `streaming/silver_transforms.py::_parse_payload`).
 
+**Keep the Python boundary narrow.** `applyInPandasWithState` calls Python once per card per
+micro-batch, and every column crossing the JVM/Python boundary costs a pandas conversion on each
+call. Profiling showed that bookkeeping, not the fraud logic, was ~95% of the operator's time. The
+operator now receives only the six columns the engine reads plus the rest of the row packed into
+one JSON string by the JVM, and returns the features as a single `array<double>`; Spark unpacks both
+afterwards. Python-side cost per card dropped from ~10 ms to ~2 ms
+(`streaming/gold_sink.py::user_feature_stream`).
+
 **The lakehouse is the system of record.** Postgres is a serving copy (it even runs with
 `synchronous_commit = off` for ingest throughput). The nightly job
 [`batch/historical_reconciliation.py`](batch/historical_reconciliation.py) anti-joins the gold Delta table
@@ -152,7 +160,9 @@ dimension members map to `-1` rows so a brand-new card is still scored and loade
 **Laptop-friendly by design.** Dimensions are cached on executors and refreshed every 5 minutes
 rather than re-read per batch; Delta's snapshot reconstruction is sized for a 4-core cluster;
 connector JARs are resolved at image build time (skipping anything Spark already ships, and pinning
-Jackson modules to Spark's version) so containers start offline.
+Jackson modules to Spark's version) so containers start offline. The producer waits for a readiness
+healthcheck on the streaming driver, so startup does not create a backlog, and every Delta-to-Delta
+hop is rate-limited (`maxBytesPerTrigger`) so a backlog, if one exists, drains in bounded batches.
 
 ---
 
@@ -292,7 +302,7 @@ Docker** for the full cluster (see *laptop mode* below for smaller machines).
 ```bash
 cp .env.example .env                  # optional: tune rates, population, credentials
 docker compose up -d --build          # builds images, seeds dimensions, starts everything
-docker compose logs -f pipeline       # wait for "layer gold started"
+docker compose logs -f pipeline       # traffic starts once "layer gold started" is logged
 ```
 
 Then open the dashboard at <http://localhost:8501>, the Spark cluster at <http://localhost:8080>
@@ -313,11 +323,16 @@ docker compose down -v                                                        # 
 
 On machines with less than ~16 GB of RAM, running three extra Spark JVMs can push the Docker VM
 into host swap. Laptop mode runs the identical job with Spark in local mode inside the driver
-container (same queries, same checkpoints):
+container and is tuned for a few slow cores: 10 s / 30 s triggers, 4 state partitions and a default
+rate of 100 events/s (see *Measured on a laptop* below).
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.laptop.yml up -d --build
+LAPTOP_PRODUCER_RATE=200 docker compose -f docker-compose.yml -f docker-compose.laptop.yml up -d producer
 ```
+
+State partitions are fixed when a checkpoint is created, so switch between cluster and laptop mode
+on fresh volumes (`docker compose down -v`).
 
 ### Configuration
 
@@ -332,6 +347,7 @@ All settings are environment variables ([`common/settings.py`](common/settings.p
 | `STREAM_WATERMARK_DELAY` | `10 minutes` | lateness tolerated before events are dropped |
 | `STREAM_WINDOW_DURATION` / `STREAM_WINDOW_SLIDE` | `5 minutes` / `1 minute` | merchant sliding windows |
 | `STREAM_MAX_OFFSETS_PER_TRIGGER` | `50000` | backpressure: cap on records per bronze batch |
+| `STREAM_MAX_BYTES_PER_TRIGGER` | `16m` | backpressure: cap on data per batch for Delta-to-Delta hops |
 | `FRAUD_RULES_PATH` | `config/fraud_rules.yaml` | rule weights and thresholds |
 
 ---
@@ -385,9 +401,31 @@ latency (Kafka append → queryable in Postgres). The same numbers are live on t
 *Pipeline health* panel and in the `pipeline_latency_slo` SQL model.
 
 Throughput scales with executor cores. The main tuning levers are `STREAM_TRIGGER_INTERVAL`,
-`STREAM_MAX_OFFSETS_PER_TRIGGER` (backpressure), the number of Kafka partitions (bronze read
-parallelism) and `spark.sql.shuffle.partitions` (parallelism of the stateful operators; fixed
-per checkpoint). On a constrained laptop, use laptop mode and a lower `PRODUCER_RATE`.
+`STREAM_MAX_OFFSETS_PER_TRIGGER` / `STREAM_MAX_BYTES_PER_TRIGGER` (backpressure), the number of
+Kafka partitions (bronze read parallelism) and `spark.sql.shuffle.partitions` (parallelism of the
+stateful operators; fixed per checkpoint).
+
+### Measured on a laptop
+
+The development machine is a small laptop: Intel i5-1035G7 (4 cores, pinned at its 1.2 GHz base
+clock during these runs), 16 GB RAM, with the Docker VM given 8 vCPUs and 7.5 GB. The whole stack
+(Kafka, Postgres, producer, dashboard and all 8 streaming queries) ran in laptop mode, with host CPU
+at 100% throughout. Numbers come from `ops.streaming_query_progress` and the gold sink's batch log:
+
+| Measurement | Result |
+|---|---|
+| End-to-end correctness | 80,424 transactions scored and loaded, 133 fraud alerts raised, chargebacks and 17k+ merchant-window rows upserted |
+| Bronze (Kafka → Delta) | ~950 rows/s on 40–50k-row batches; zero Kafka lag at 200 events/s |
+| Gold (stateful features → scoring → Delta + Postgres) | ~105 rows/s (46,037-row batch in 440 s) |
+| Gold per-card Python cost | ~2 ms per card (down from ~10 ms before narrowing the Python boundary) |
+
+Gold is the bottleneck on this hardware. Its time is dominated by one stage, the per-card
+`applyInPandasWithState` call, where Spark's fixed per-group overhead now outweighs the Python
+feature code itself. That is why laptop mode defaults to 100 events/s. The stateful operator is
+keyed by card and parallelises across `spark.sql.shuffle.partitions`, so it scales with executor
+cores: cluster mode on a machine with more cores is the way to push rates higher. The 2 s
+micro-batch SLO is the target the monitoring tracks; it was not met on this laptop, and no
+cluster-mode numbers are claimed here because none were measured on suitable hardware.
 
 ---
 

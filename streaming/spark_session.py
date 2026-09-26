@@ -7,7 +7,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.streaming import DataStreamWriter
 from pyspark.sql.types import StructField, StructType
 
@@ -61,6 +61,11 @@ def scheduler_pool(spark: SparkSession, pool: str) -> Iterator[None]:
         yield
     finally:
         sc.setLocalProperty("spark.scheduler.pool", previous)  # type: ignore[arg-type]
+
+
+def read_delta_stream(spark: SparkSession, path: str, max_bytes_per_trigger: str) -> DataFrame:
+    """Stream a Delta table with a per-batch size cap, so a backlog drains in bounded micro-batches."""
+    return spark.readStream.format("delta").option("maxBytesPerTrigger", max_bytes_per_trigger).load(path)
 
 
 def with_trigger(writer: DataStreamWriter, interval: str) -> DataStreamWriter:

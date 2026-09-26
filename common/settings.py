@@ -100,6 +100,8 @@ class StreamingSettings:
     window_slide: str = field(default_factory=lambda: _env("STREAM_WINDOW_SLIDE", "1 minute"))
     max_offsets_per_trigger: int = field(default_factory=lambda: _env_int("STREAM_MAX_OFFSETS_PER_TRIGGER", 50_000))
     starting_offsets: str = field(default_factory=lambda: _env("STREAM_STARTING_OFFSETS", "earliest"))
+    # Backpressure for Delta-to-Delta hops, so a backlog drains in bounded micro-batches.
+    max_bytes_per_trigger: str = field(default_factory=lambda: _env("STREAM_MAX_BYTES_PER_TRIGGER", "16m"))
     user_state_idle_timeout: str = field(default_factory=lambda: _env("STREAM_USER_STATE_IDLE_TIMEOUT", "1 hour"))
     dimension_refresh_seconds: int = field(default_factory=lambda: _env_int("DIMENSION_REFRESH_SECONDS", 300))
     rules_path: str = field(default_factory=lambda: _env("FRAUD_RULES_PATH", "config/fraud_rules.yaml"))

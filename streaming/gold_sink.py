@@ -31,19 +31,22 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQuery
 from pyspark.sql.streaming.state import GroupStateTimeout
+from pyspark.sql.types import StructType
 
 from common.settings import PostgresSettings, Settings
 from streaming.expressions import date_key, haversine_km
-from streaming.features import make_state_function
+from streaming.features import ENGINE_INPUT_COLUMNS, FEATURE_NAMES, make_state_function
 from streaming.postgres_writer import UpsertSpec, upsert_dataframe
 from streaming.schemas import (
     GOLD_TRANSACTION_SCHEMA,
-    USER_FEATURE_OUTPUT_SCHEMA,
+    SILVER_TRANSACTION_SCHEMA,
+    USER_FEATURE_ENGINE_OUTPUT_SCHEMA,
+    USER_FEATURE_FIELDS,
     USER_FEATURE_STATE_SCHEMA,
 )
 from streaming.scoring import RuleSet, apply_rules, load_rules
 from streaming.silver_transforms import sliding_window_aggregate
-from streaming.spark_session import ensure_delta_table, scheduler_pool, with_trigger
+from streaming.spark_session import ensure_delta_table, read_delta_stream, scheduler_pool, with_trigger
 
 log = logging.getLogger(__name__)
 
@@ -313,19 +316,50 @@ def _chargebacks_sink(settings: Settings, dims: DimensionCache):
 # --------------------------------------------------------------------------- wiring
 
 
+# Silver columns the feature engine does not read travel through the stateful operator
+# as one JSON string (see features.ENGINE_INPUT_COLUMNS for why).
+_PASSTHROUGH_SCHEMA = StructType(
+    [f for f in SILVER_TRANSACTION_SCHEMA.fields if f.name not in ("transaction_id", "event_ts")]
+)
+_PASSTHROUGH_JSON = {"timestampFormat": "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXX"}  # keep microseconds
+
+
 def user_feature_stream(silver: DataFrame, watermark: str, idle_timeout: str) -> DataFrame:
-    """Per-card stateful feature computation (see streaming/features.py)."""
-    return (
-        silver.withWatermark("event_ts", watermark)
-        .groupBy("user_id")
-        .applyInPandasWithState(
-            make_state_function(parse_duration_ms(idle_timeout)),
-            outputStructType=USER_FEATURE_OUTPUT_SCHEMA,
-            stateStructType=USER_FEATURE_STATE_SCHEMA,
-            outputMode="append",
-            timeoutConf=GroupStateTimeout.EventTimeTimeout,
-        )
+    """Per-card stateful feature computation (see streaming/features.py).
+
+    Returns silver rows with the feature columns appended (USER_FEATURE_OUTPUT_SCHEMA).
+    """
+    narrow = silver.withWatermark("event_ts", watermark).select(
+        "user_id",
+        "transaction_id",
+        "event_ts",
+        F.col("amount_usd").cast("double").alias("amount_usd"),
+        "merchant_id",
+        "location_lat",
+        "location_lon",
+        F.to_json(F.struct(*_PASSTHROUGH_SCHEMA.fieldNames()), _PASSTHROUGH_JSON).alias("passthrough"),
     )
+    assert narrow.columns == ENGINE_INPUT_COLUMNS
+    scored = narrow.groupBy("user_id").applyInPandasWithState(
+        make_state_function(parse_duration_ms(idle_timeout)),
+        outputStructType=USER_FEATURE_ENGINE_OUTPUT_SCHEMA,
+        stateStructType=USER_FEATURE_STATE_SCHEMA,
+        outputMode="append",
+        timeoutConf=GroupStateTimeout.EventTimeTimeout,
+    )
+    # inline(array(...)) parses each JSON string once (a plain struct expansion would
+    # let the optimizer re-parse it per field - see silver_transforms._parse_payload).
+    unpacked = scored.select(
+        "transaction_id",
+        "event_ts",
+        "features",
+        F.inline(F.array(F.from_json("passthrough", _PASSTHROUGH_SCHEMA, _PASSTHROUGH_JSON))),
+    )
+    feature_cols = [
+        F.col("features")[i].cast(field.dataType).alias(field.name) for i, field in enumerate(USER_FEATURE_FIELDS)
+    ]
+    assert [f.name for f in USER_FEATURE_FIELDS] == FEATURE_NAMES
+    return unpacked.select(*SILVER_TRANSACTION_SCHEMA.fieldNames(), *feature_cols)
 
 
 def merchant_risk_windows(gold: DataFrame, window: str, slide: str, watermark: str) -> DataFrame:
@@ -367,7 +401,7 @@ def start(spark: SparkSession, settings: Settings) -> list[StreamingQuery]:
 
     queries: list[StreamingQuery] = []
     with scheduler_pool(spark, "gold"):
-        silver = spark.readStream.format("delta").load(lake.silver_transactions)
+        silver = read_delta_stream(spark, lake.silver_transactions, s.max_bytes_per_trigger)
         features = user_feature_stream(silver, s.watermark_delay, s.user_state_idle_timeout)
         checkpoint = lake.checkpoint("gold_transactions")
         queries.append(
@@ -381,7 +415,7 @@ def start(spark: SparkSession, settings: Settings) -> list[StreamingQuery]:
         )
 
     with scheduler_pool(spark, "gold_aggregates"):
-        gold = spark.readStream.format("delta").load(lake.gold_transactions)
+        gold = read_delta_stream(spark, lake.gold_transactions, s.max_bytes_per_trigger)
         queries.append(
             with_trigger(
                 merchant_risk_windows(gold, s.window_duration, s.window_slide, s.watermark_delay)
@@ -392,7 +426,7 @@ def start(spark: SparkSession, settings: Settings) -> list[StreamingQuery]:
                 s.slow_trigger_interval,
             ).start()
         )
-        chargebacks = spark.readStream.format("delta").load(lake.silver_chargebacks)
+        chargebacks = read_delta_stream(spark, lake.silver_chargebacks, s.max_bytes_per_trigger)
         queries.append(
             with_trigger(
                 chargebacks.writeStream.queryName("gold_chargebacks")

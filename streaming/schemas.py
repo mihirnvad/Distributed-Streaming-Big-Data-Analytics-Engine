@@ -170,6 +170,17 @@ USER_FEATURE_FIELDS = [
     StructField("history_count", LongType()),
 ]
 
+# Narrow contract of the stateful operator itself (streaming.features.ENGINE_*_COLUMNS).
+USER_FEATURE_ENGINE_OUTPUT_SCHEMA = StructType(
+    [
+        StructField("transaction_id", StringType()),
+        StructField("event_ts", TimestampType()),
+        StructField("passthrough", StringType()),
+        StructField("features", ArrayType(DoubleType())),
+    ]
+)
+
+# Silver row + features, after the operator's output is unpacked.
 USER_FEATURE_OUTPUT_SCHEMA = StructType(
     [StructField(f.name, f.dataType, True) for f in SILVER_TRANSACTION_SCHEMA.fields] + USER_FEATURE_FIELDS
 )

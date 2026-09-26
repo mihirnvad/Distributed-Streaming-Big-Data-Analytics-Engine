@@ -9,7 +9,8 @@ import pytest
 
 from common.geo import haversine_km
 from streaming.features import (
-    FEATURE_INPUT_COLUMNS,
+    ENGINE_INPUT_COLUMNS,
+    ENGINE_OUTPUT_COLUMNS,
     FEATURE_NAMES,
     MIN_HISTORY_FOR_BASELINE,
     MIN_HISTORY_FOR_ZSCORE,
@@ -130,33 +131,27 @@ def test_state_tuple_arity_matches_spark_schema():
     assert len(UserState().to_tuple()) == len(USER_FEATURE_STATE_SCHEMA.fields)
 
 
-def test_compute_features_sorts_by_event_time_and_appends_columns():
-    rows = []
-    for i, offset in enumerate((120, 0, 60)):
-        rows.append(
-            {
-                "transaction_id": f"t{i}",
-                "event_ts": pd.Timestamp(T0 + offset * 1000, unit="ms"),
-                "event_date": pd.Timestamp(T0, unit="ms").date(),
-                "user_id": "U1",
-                "card_id": "c",
-                "merchant_id": f"M{i}",
-                "amount": 10.0,
-                "currency": "USD",
-                "amount_usd": 10.0,
-                "channel": "POS",
-                "entry_mode": "CHIP",
-                "location_lat": NYC[0],
-                "location_lon": NYC[1],
-                "city": "New York",
-                "country_code": "US",
-                "kafka_partition": 0,
-                "kafka_offset": i,
-                "kafka_ts": pd.Timestamp(T0, unit="ms"),
-            }
-        )
-    out = compute_features(UserFeatureEngine(), pd.DataFrame(rows))
-    assert list(out.columns) == FEATURE_INPUT_COLUMNS + FEATURE_NAMES
+def test_compute_features_sorts_by_event_time_and_returns_feature_arrays():
+    rows = [
+        {
+            "user_id": "U1",
+            "transaction_id": f"t{i}",
+            "event_ts": pd.Timestamp(T0 + offset * 1000, unit="ms"),
+            "amount_usd": 10.0,
+            "merchant_id": f"M{i}",
+            "location_lat": NYC[0],
+            "location_lon": NYC[1],
+            "passthrough": f'{{"row": {i}}}',
+        }
+        for i, offset in enumerate((120, 0, 60))
+    ]
+    pdf = pd.DataFrame(rows)
+    assert list(pdf.columns) == ENGINE_INPUT_COLUMNS
+    out = compute_features(UserFeatureEngine(), pdf)
+    assert list(out.columns) == ENGINE_OUTPUT_COLUMNS
     assert list(out["transaction_id"]) == ["t1", "t2", "t0"]
-    assert list(out["txn_count_5m"]) == [1, 2, 3]
-    assert math.isclose(out["seconds_since_prev"].iloc[2], 60.0)
+    assert list(out["passthrough"]) == ['{"row": 1}', '{"row": 2}', '{"row": 0}']  # travels with its row
+    feature = {name: [f[i] for f in out["features"]] for i, name in enumerate(FEATURE_NAMES)}
+    assert feature["txn_count_5m"] == [1, 2, 3]
+    assert feature["seconds_since_prev"][0] is None
+    assert math.isclose(feature["seconds_since_prev"][2], 60.0)

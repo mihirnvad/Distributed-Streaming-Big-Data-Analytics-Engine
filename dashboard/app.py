@@ -89,6 +89,12 @@ def _num(df: pd.DataFrame, col: str, default: float = 0.0) -> float:
     return float(df.iloc[0][col])
 
 
+def _fmt(df: pd.DataFrame, col: str, spec: str, unit: str = "") -> str:
+    """Format a single-row metric, or an em dash when there is no data (never a misleading 0)."""
+    value = _num(df, col, default=float("nan"))
+    return "—" if pd.isna(value) else format(value, spec) + unit
+
+
 # --------------------------------------------------------------------------- panels
 
 
@@ -113,13 +119,15 @@ def kpi_row(tw: q.TimeWindow) -> None:
     )
     c[4].metric(
         "p95 end-to-end latency",
-        f"{_num(e2e, 'p95_s'):.1f} s",
-        help=f"Kafka append -> queryable in Postgres (p50 {_num(e2e, 'p50_s'):.1f} s), rows loaded in last 5 min",
+        _fmt(e2e, "p95_s", ".1f", " s"),
+        help=f"Kafka append -> queryable in Postgres, rows loaded in the last 5 min "
+        f"(p50 {_fmt(e2e, 'p50_s', '.1f', ' s')})",
     )
     c[5].metric(
         "p95 micro-batch",
-        f"{_num(mb, 'p95_s'):.2f} s",
-        help=f"Gold scoring batch duration (p50 {_num(mb, 'p50_s'):.2f} s over {_num(mb, 'batches'):,.0f} batches)",
+        _fmt(mb, "p95_s", ".2f", " s"),
+        help=f"Gold scoring batch duration (p50 {_fmt(mb, 'p50_s', '.2f', ' s')} "
+        f"over {_num(mb, 'batches'):,.0f} batches)",
     )
 
 
@@ -133,8 +141,9 @@ def volume_and_alert_charts(tw: q.TimeWindow) -> None:
             go.Scatter(
                 x=ts.get("bucket"),
                 y=ts.get("txn_count"),
-                mode="lines",
+                mode="lines+markers",  # markers keep isolated buckets visible
                 line={"width": 2, "color": series[0]},
+                marker={"size": 5},
                 hovertemplate="%{x|%H:%M}<br>%{y:,} transactions<extra></extra>",
             )
         )
@@ -145,8 +154,9 @@ def volume_and_alert_charts(tw: q.TimeWindow) -> None:
             go.Scatter(
                 x=ts.get("bucket"),
                 y=ts.get("alert_rate_pct"),
-                mode="lines",
+                mode="lines+markers",
                 line={"width": 2, "color": series[1]},
+                marker={"size": 5},
                 customdata=ts.get("alert_count"),
                 hovertemplate="%{x|%H:%M}<br>%{y:.2f}% flagged (%{customdata:,} alerts)<extra></extra>",
             )

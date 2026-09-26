@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
+from pathlib import Path
 
 from common.settings import PostgresSettings, load_settings
 from streaming import bronze_ingestion, gold_sink, silver_transforms
@@ -23,6 +25,9 @@ from streaming.spark_session import build_spark
 log = logging.getLogger("pipeline")
 
 LAYERS = {"bronze": bronze_ingestion, "silver": silver_transforms, "gold": gold_sink}
+# Touched once every requested query is running; the compose healthcheck watches it so
+# the producer only starts when the pipeline can keep up (no startup backlog).
+READY_FILE = Path(os.environ.get("PIPELINE_READY_FILE", "/tmp/pipeline-ready"))
 
 
 def ensure_warehouse_partitions(pg: PostgresSettings, days_ahead: int = 30) -> None:
@@ -46,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     if unknown:
         parser.error(f"unknown layer(s): {sorted(unknown)}")
 
+    READY_FILE.unlink(missing_ok=True)  # a restarted container must not look ready early
     settings = load_settings()
     spark = build_spark("fraud-streaming-pipeline")
     if not args.no_metrics:
@@ -60,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             queries.extend(started)
             log.info("layer %s started: %s", layer, ", ".join(q.name for q in started))
 
+    READY_FILE.touch()
     stopping = threading.Event()
 
     def shutdown(signum, _frame) -> None:
@@ -76,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         spark.streams.awaitAnyTermination()
     finally:
+        READY_FILE.unlink(missing_ok=True)
         failed = [q for q in queries if q.exception() is not None]
         for q in queries:
             if q.isActive:

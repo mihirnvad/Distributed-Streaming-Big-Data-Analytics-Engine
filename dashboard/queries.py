@@ -78,14 +78,26 @@ WHERE query_name = 'gold_transactions'
   AND progress_ts >= now() - %(window)s::interval
 """
 
+# Every bucket in the window is returned (gap-filled), so the x-axis always spans the
+# selected range: quiet periods show 0 transactions and a gap in the alert rate.
 TIMESERIES = """
-SELECT date_bin(%(bucket)s::interval, event_ts, timestamptz '2000-01-01') AS bucket,
-       count(*)                                        AS txn_count,
-       count(*) FILTER (WHERE is_flagged)              AS alert_count,
-       round(100.0 * count(*) FILTER (WHERE is_flagged) / count(*), 3) AS alert_rate_pct
-FROM dw.fact_transactions
-WHERE event_ts >= now() - %(window)s::interval
-GROUP BY 1
+WITH buckets AS (
+    SELECT generate_series(date_bin(%(bucket)s::interval, now() - %(window)s::interval, timestamptz '2000-01-01'),
+                           now(), %(bucket)s::interval) AS bucket
+), agg AS (
+    SELECT date_bin(%(bucket)s::interval, event_ts, timestamptz '2000-01-01') AS bucket,
+           count(*)                           AS txn_count,
+           count(*) FILTER (WHERE is_flagged) AS alert_count
+    FROM dw.fact_transactions
+    WHERE event_ts >= now() - %(window)s::interval
+    GROUP BY 1
+)
+SELECT b.bucket,
+       coalesce(a.txn_count, 0)                                  AS txn_count,
+       coalesce(a.alert_count, 0)                                AS alert_count,
+       round(100.0 * a.alert_count / nullif(a.txn_count, 0), 3) AS alert_rate_pct
+FROM buckets b
+LEFT JOIN agg a USING (bucket)
 ORDER BY 1
 """
 

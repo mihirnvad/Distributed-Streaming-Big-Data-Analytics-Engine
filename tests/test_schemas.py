@@ -21,6 +21,7 @@ from streaming.schemas import (
     SILVER_CHARGEBACK_SCHEMA,
     SILVER_TRANSACTION_SCHEMA,
     TRANSACTION_EVENT_SCHEMA,
+    USER_FEATURE_ENGINE_OUTPUT_SCHEMA,
     USER_FEATURE_FIELDS,
     USER_FEATURE_OUTPUT_SCHEMA,
 )
@@ -37,6 +38,7 @@ def test_feature_engine_contract_matches_spark_schemas():
     assert [
         f.name for f in USER_FEATURE_OUTPUT_SCHEMA.fields
     ] == features.FEATURE_INPUT_COLUMNS + features.FEATURE_NAMES
+    assert [f.name for f in USER_FEATURE_ENGINE_OUTPUT_SCHEMA.fields] == features.ENGINE_OUTPUT_COLUMNS
 
 
 def test_gold_schema_has_unique_columns():
